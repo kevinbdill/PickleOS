@@ -114,7 +114,7 @@ pub extern "C" fn vfs_server_task() -> ! {
 pub fn request(req: VfsRequest) -> Option<VfsResponse> {
     let ep = ipc::lookup(VFS_ENDPOINT)?;
     let req_ptr = Box::into_raw(Box::new(req)) as u64;
-    let reply = ipc::call(ep, Message::with_words(TAG_VFS, [req_ptr, 0, 0, 0, 0, 0]));
+    let reply = ipc::call(ep, Message::with_words(TAG_VFS, [req_ptr, 0, 0, 0, 0, 0])).unwrap_or_else(|_| Message::default());
     let resp_ptr = reply.words[0] as *mut VfsResponse;
     if resp_ptr.is_null() {
         return None;

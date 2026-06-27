@@ -27,7 +27,8 @@ pub struct NetworkStack {
     next_socket_id: u32,
 }
 
-/// Public socket ID type
+/// Maximum number of sockets allowed (prevents unbounded growth).
+const MAX_SOCKETS: usize = 64;
 pub type SocketId = u32;
 
 /// E1000 device wrapper for smoltcp
@@ -125,7 +126,10 @@ impl NetworkStack {
     }
     
     /// Create a new TCP socket
-    pub fn create_tcp_socket(&mut self) -> u32 {
+    pub fn create_tcp_socket(&mut self) -> Result<u32, &'static str> {
+        if self.socket_map.len() >= MAX_SOCKETS {
+            return Err("max sockets limit reached");
+        }
         let tcp_rx_buffer = tcp::SocketBuffer::new(vec![0; 8192]);
         let tcp_tx_buffer = tcp::SocketBuffer::new(vec![0; 8192]);
         let tcp_socket = tcp::Socket::new(tcp_rx_buffer, tcp_tx_buffer);
@@ -135,11 +139,14 @@ impl NetworkStack {
         self.next_socket_id += 1;
         
         self.socket_map.insert(socket_id, handle);
-        socket_id
+        Ok(socket_id)
     }
     
     /// Create a new UDP socket
-    pub fn create_udp_socket(&mut self) -> u32 {
+    pub fn create_udp_socket(&mut self) -> Result<u32, &'static str> {
+        if self.socket_map.len() >= MAX_SOCKETS {
+            return Err("max sockets limit reached");
+        }
         let udp_rx_buffer = udp::PacketBuffer::new(
             vec![udp::PacketMetadata::EMPTY; 16],
             vec![0; 4096],
@@ -155,7 +162,7 @@ impl NetworkStack {
         self.next_socket_id += 1;
         
         self.socket_map.insert(socket_id, handle);
-        socket_id
+        Ok(socket_id)
     }
     
     /// Bind a TCP socket to a local port (for listen)
@@ -296,9 +303,14 @@ impl NetworkStack {
     }
     
     /// Poll the network stack
+    ///
+    /// LOCK ORDERING: STACK must be acquired before DEVICE (the E1000
+    /// device mutex in e1000.rs). Acquiring DEVICE while holding STACK
+    /// is safe; the reverse (DEVICE then STACK) would deadlock.
     pub fn poll(&mut self) {
         let timestamp = Instant::from_millis(crate::task::scheduler::ticks() as i64);
-        self.interface.poll(timestamp, &mut E1000Device, &mut self.sockets);
+        self.interface
+            .poll(timestamp, &mut E1000Device, &mut self.sockets);
     }
 }
 
@@ -313,7 +325,7 @@ pub fn init() {
 pub fn create_tcp_socket() -> Result<u32, &'static str> {
     let mut stack = STACK.lock();
     if let Some(ref mut s) = *stack {
-        Ok(s.create_tcp_socket())
+        s.create_tcp_socket()
     } else {
         Err("network stack not initialized")
     }
@@ -323,7 +335,7 @@ pub fn create_tcp_socket() -> Result<u32, &'static str> {
 pub fn create_udp_socket() -> Result<u32, &'static str> {
     let mut stack = STACK.lock();
     if let Some(ref mut s) = *stack {
-        Ok(s.create_udp_socket())
+        s.create_udp_socket()
     } else {
         Err("network stack not initialized")
     }

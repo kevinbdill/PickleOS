@@ -238,11 +238,11 @@ pub fn init() {
 
     // 8. Probe each implemented port to see if a device is attached.
     let mut ports = Vec::new();
-    for i in 0..32 {
+    for i in 0..num_ports as usize {
         if (pi & (1 << i)) == 0 {
             continue; // port not implemented
         }
-        if let Some(port) = probe_port(abar_phys, i) {
+        if let Some(port) = probe_port(abar_phys, i as u8) {
             serial_println!(
                 "[ahci] port {} — {:?} device (sig {:#010x})",
                 i,
@@ -505,38 +505,44 @@ fn issue_command(
 
     // 3. Build the command header (slot 0) in the command list.
     let clb_virt = dma::phys_to_virt(clb_phys);
-    let cmd_hdr = unsafe { &mut *(clb_virt.as_mut_ptr::<CommandHeader>()) };
+    let cmd_hdr_ptr: *mut CommandHeader = clb_virt.as_mut_ptr::<CommandHeader>();
     let prdtl: u16 = if byte_count > 0 { 1 } else { 0 };
     let mut flags: u16 = 5 & 0x1F; // CFL = 5 dwords (20-byte H2D FIS)
     if dir == Direction::Write {
         flags |= 1 << 6; // W bit: host-to-device data
     }
-    cmd_hdr.flags = flags;
-    cmd_hdr.prdtl = prdtl;
-    cmd_hdr.prdbc = 0;
-    cmd_hdr.ctba = (ct_phys.as_u64() & 0xFFFFFFFF) as u32;
-    cmd_hdr.ctbau = (ct_phys.as_u64() >> 32) as u32;
+    unsafe {
+        core::ptr::addr_of_mut!((*cmd_hdr_ptr).flags).write_unaligned(flags);
+        core::ptr::addr_of_mut!((*cmd_hdr_ptr).prdtl).write_unaligned(prdtl);
+        core::ptr::addr_of_mut!((*cmd_hdr_ptr).prdbc).write_unaligned(0);
+        core::ptr::addr_of_mut!((*cmd_hdr_ptr).ctba).write_unaligned((ct_phys.as_u64() & 0xFFFFFFFF) as u32);
+        core::ptr::addr_of_mut!((*cmd_hdr_ptr).ctbau).write_unaligned((ct_phys.as_u64() >> 32) as u32);
+    }
 
     // 4. Build the command table (zeroed) and the H2D Register FIS.
     let ct_virt = dma::phys_to_virt(ct_phys.as_u64());
     unsafe {
         core::ptr::write_bytes(ct_virt.as_mut_ptr::<u8>(), 0, 256);
     }
-    let fis = unsafe { &mut *(ct_virt.as_mut_ptr::<FisRegH2D>()) };
-    fis.fis_type = FIS_TYPE_REG_H2D;
-    fis.flags = 0x80; // C bit: this is a command
-    fis.command = command;
-    // 48-bit LBA, split across the two register banks.
-    fis.lba_lo = (lba & 0xFF) as u8;
-    fis.lba_mid = ((lba >> 8) & 0xFF) as u8;
-    fis.lba_hi = ((lba >> 16) & 0xFF) as u8;
-    fis.lba_lo_exp = ((lba >> 24) & 0xFF) as u8;
-    fis.lba_mid_exp = ((lba >> 32) & 0xFF) as u8;
-    fis.lba_hi_exp = ((lba >> 40) & 0xFF) as u8;
-    // device register: bit 6 = LBA mode (required for DMA EXT commands).
-    fis.device = if command == ATA_CMD_IDENTIFY { 0 } else { 1 << 6 };
-    fis.count_lo = (sector_count & 0xFF) as u8;
-    fis.count_hi = ((sector_count >> 8) & 0xFF) as u8;
+    let fis_ptr: *mut FisRegH2D = ct_virt.as_mut_ptr::<FisRegH2D>();
+    unsafe {
+        core::ptr::addr_of_mut!((*fis_ptr).fis_type).write_unaligned(FIS_TYPE_REG_H2D);
+        core::ptr::addr_of_mut!((*fis_ptr).flags).write_unaligned(0x80); // C bit: this is a command
+        core::ptr::addr_of_mut!((*fis_ptr).command).write_unaligned(command);
+        // 48-bit LBA, split across the two register banks.
+        core::ptr::addr_of_mut!((*fis_ptr).lba_lo).write_unaligned((lba & 0xFF) as u8);
+        core::ptr::addr_of_mut!((*fis_ptr).lba_mid).write_unaligned(((lba >> 8) & 0xFF) as u8);
+        core::ptr::addr_of_mut!((*fis_ptr).lba_hi).write_unaligned(((lba >> 16) & 0xFF) as u8);
+        core::ptr::addr_of_mut!((*fis_ptr).lba_lo_exp).write_unaligned(((lba >> 24) & 0xFF) as u8);
+        core::ptr::addr_of_mut!((*fis_ptr).lba_mid_exp).write_unaligned(((lba >> 32) & 0xFF) as u8);
+        core::ptr::addr_of_mut!((*fis_ptr).lba_hi_exp).write_unaligned(((lba >> 40) & 0xFF) as u8);
+        // device register: bit 6 = LBA mode (required for DMA EXT commands).
+        core::ptr::addr_of_mut!((*fis_ptr).device).write_unaligned(
+            if command == ATA_CMD_IDENTIFY { 0 } else { 1 << 6 }
+        );
+        core::ptr::addr_of_mut!((*fis_ptr).count_lo).write_unaligned((sector_count & 0xFF) as u8);
+        core::ptr::addr_of_mut!((*fis_ptr).count_hi).write_unaligned(((sector_count >> 8) & 0xFF) as u8);
+    }
 
     // 5. Build the single PRD entry at offset 128, if there is a data phase.
     if byte_count > 0 {
@@ -787,10 +793,16 @@ pub fn parse_identify(identity: &[u8; 512]) -> DriveInfo {
         | ((word(102) as u64) << 32)
         | ((word(103) as u64) << 48);
 
-    // Logical sector size: words 117–118 (if bit 12 of word 106 is set, else 512).
-    let sector_size = if (word(106) & (1 << 12)) != 0 {
+    // Logical sector size: words 117–118 (if bit 14 of word 106 is set, else 512).
+    let sector_size = if (word(106) & (1 << 14)) != 0 {
         let sz = (word(117) as u32) | ((word(118) as u32) << 16);
-        sz * 2 // value is in words, convert to bytes
+        let size_bytes = sz * 2; // value is in words, convert to bytes
+        // Validate: must be non-zero and a power of 2
+        if size_bytes == 0 || (size_bytes & (size_bytes - 1)) != 0 {
+            512
+        } else {
+            size_bytes
+        }
     } else {
         512
     };

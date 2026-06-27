@@ -87,6 +87,9 @@ const NUM_TX_DESC: usize = 16;
 /// RX buffer size (2048 bytes per packet)
 const RX_BUFFER_SIZE: usize = 2048;
 
+/// TX buffer size (2048 bytes per packet)
+const TX_BUFFER_SIZE: usize = 2048;
+
 /// RX descriptor (legacy format)
 #[repr(C, align(16))]
 #[derive(Debug, Clone, Copy)]
@@ -298,7 +301,7 @@ impl E1000 {
     
     /// Transmit a packet
     pub fn transmit(&mut self, data: &[u8]) -> Result<(), &'static str> {
-        if data.len() > RX_BUFFER_SIZE {
+        if data.len() > TX_BUFFER_SIZE {
             return Err("Packet too large");
         }
         

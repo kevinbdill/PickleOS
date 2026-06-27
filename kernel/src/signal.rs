@@ -26,16 +26,64 @@ pub const NSIG: usize = 32;
 pub const SIGHUP: u32 = 1;
 /// Interrupt, e.g. Ctrl-C (default: terminate).
 pub const SIGINT: u32 = 2;
+/// Quit (default: terminate + core dump).
+pub const SIGQUIT: u32 = 3;
+/// Illegal instruction (default: terminate + core dump).
+pub const SIGILL: u32 = 4;
+/// Trace/breakpoint trap (default: terminate + core dump).
+pub const SIGTRAP: u32 = 5;
+/// Abort (default: terminate + core dump).
+pub const SIGABRT: u32 = 6;
+/// Bus error (default: terminate + core dump).
+pub const SIGBUS: u32 = 7;
+/// Floating-point exception (default: terminate + core dump).
+pub const SIGFPE: u32 = 8;
 /// Kill — cannot be caught or ignored (default: terminate).
 pub const SIGKILL: u32 = 9;
 /// User-defined signal 1 (default: terminate).
 pub const SIGUSR1: u32 = 10;
+/// Segmentation violation (default: terminate + core dump).
+pub const SIGSEGV: u32 = 11;
 /// User-defined signal 2 (default: terminate).
 pub const SIGUSR2: u32 = 12;
+/// Broken pipe (default: terminate).
+pub const SIGPIPE: u32 = 13;
+/// Alarm clock (default: terminate).
+pub const SIGALRM: u32 = 14;
 /// Termination request (default: terminate, but catchable).
 pub const SIGTERM: u32 = 15;
+/// Stack fault (default: terminate).
+pub const SIGSTKFLT: u32 = 16;
 /// Child stopped or terminated (default: ignore).
 pub const SIGCHLD: u32 = 17;
+/// Continue (default: continue/ignore).
+pub const SIGCONT: u32 = 18;
+/// Stop — cannot be caught or ignored (default: stop).
+pub const SIGSTOP: u32 = 19;
+/// Terminal stop signal (default: stop).
+pub const SIGTSTP: u32 = 20;
+/// Background read from tty (default: stop).
+pub const SIGTTIN: u32 = 21;
+/// Background write to tty (default: stop).
+pub const SIGTTOU: u32 = 22;
+/// Urgent I/O condition (default: ignore).
+pub const SIGURG: u32 = 23;
+/// CPU time limit exceeded (default: terminate + core dump).
+pub const SIGXCPU: u32 = 24;
+/// File size limit exceeded (default: terminate + core dump).
+pub const SIGXFSZ: u32 = 25;
+/// Virtual alarm clock (default: terminate).
+pub const SIGVTALRM: u32 = 26;
+/// Profiling alarm clock (default: terminate).
+pub const SIGPROF: u32 = 27;
+/// Window size change (default: ignore).
+pub const SIGWINCH: u32 = 28;
+/// I/O now possible (default: ignore).
+pub const SIGIO: u32 = 29;
+/// Power failure (default: terminate).
+pub const SIGPWR: u32 = 30;
+/// Bad system call (default: terminate + core dump).
+pub const SIGSYS: u32 = 31;
 
 // --- Special handler values ------------------------------------------------
 /// Default action: handler value meaning "use the signal's default behaviour".
@@ -46,7 +94,10 @@ pub const SIG_IGN: u64 = 1;
 /// Returns `true` if the default action for `sig` is to terminate the process.
 /// Signals whose default action is "ignore" (e.g. `SIGCHLD`) return `false`.
 pub fn default_terminates(sig: u32) -> bool {
-    !matches!(sig, SIGCHLD)
+    !matches!(
+        sig,
+        SIGCHLD | SIGCONT | SIGURG | SIGWINCH | SIGIO | SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU
+    )
 }
 
 /// Saved user context captured when a signal handler is invoked, used by
@@ -90,11 +141,15 @@ impl SignalState {
     }
 
     /// Reset dispositions to default (used on `exec`). Caught handlers do not
-    /// survive an `execve`, but ignored signals stay ignored on real Unix; for
-    /// simplicity we reset everything to the default action here.
+    /// survive an `execve`, but ignored signals stay ignored on real Unix.
     pub fn reset_for_exec(&mut self) {
         self.pending = 0;
-        self.handlers = [SIG_DFL; NSIG];
+        // Preserve SIG_IGN dispositions; reset everything else to SIG_DFL.
+        for h in self.handlers.iter_mut() {
+            if *h != SIG_IGN {
+                *h = SIG_DFL;
+            }
+        }
         self.restorer = 0;
         self.saved = None;
     }

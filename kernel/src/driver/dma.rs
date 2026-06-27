@@ -61,6 +61,8 @@ struct DmaAllocator {
     next_offset: u64,
     /// Total size of the pool.
     size: u64,
+    /// Tracks whether a mark() session is currently active (for debug asserts).
+    in_mark: bool,
 }
 
 impl DmaAllocator {
@@ -68,6 +70,7 @@ impl DmaAllocator {
         Self {
             next_offset: 0,
             size,
+            in_mark: false,
         }
     }
 
@@ -172,11 +175,15 @@ pub fn phys_to_virt(phys: u64) -> VirtAddr {
 /// untouched. Without this, every disk transfer would leak a buffer and the
 /// pool would exhaust within a few seconds of real disk I/O.
 pub fn mark() -> u64 {
-    DMA_ALLOCATOR
-        .lock()
-        .as_ref()
-        .map(|a| a.next_offset)
-        .unwrap_or(0)
+    let mut alloc = DMA_ALLOCATOR.lock();
+    if let Some(a) = alloc.as_mut() {
+        // debug_assert: detect nested mark() calls (mark without intervening reset_to).
+        debug_assert!(!a.in_mark, "mark() called while another mark() session is active");
+        a.in_mark = true;
+        a.next_offset
+    } else {
+        0
+    }
 }
 
 /// Roll the bump pointer back to a previously recorded [`mark`], freeing all
@@ -184,6 +191,8 @@ pub fn mark() -> u64 {
 /// mark is ignored), so it can never hand out memory that is still live.
 pub fn reset_to(mark: u64) {
     if let Some(a) = DMA_ALLOCATOR.lock().as_mut() {
+        debug_assert!(a.in_mark, "reset_to() called without a prior mark()");
+        a.in_mark = false;
         if mark <= a.next_offset {
             a.next_offset = mark;
         }

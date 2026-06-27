@@ -117,6 +117,9 @@ impl BlockDevice for AhciBlockDevice {
             let chunk = core::cmp::min(count as u64 - done, u16::MAX as u64) as u16;
             let off = done as usize * self.block_size;
             let len = chunk as usize * self.block_size;
+            if off + len > buf.len() {
+                return Err(BlockError::BadBuffer);
+            }
             ahci::read_sectors(self.port, lba + done, chunk, &mut buf[off..off + len])
                 .map_err(BlockError::DeviceError)?;
             done += chunk as u64;
@@ -131,6 +134,9 @@ impl BlockDevice for AhciBlockDevice {
             let chunk = core::cmp::min(count as u64 - done, u16::MAX as u64) as u16;
             let off = done as usize * self.block_size;
             let len = chunk as usize * self.block_size;
+            if off + len > buf.len() {
+                return Err(BlockError::BadBuffer);
+            }
             ahci::write_sectors(self.port, lba + done, chunk, &buf[off..off + len])
                 .map_err(BlockError::DeviceError)?;
             done += chunk as u64;

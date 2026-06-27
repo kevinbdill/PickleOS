@@ -278,7 +278,7 @@ mod demo {
         let ep = ipc::lookup("demo.pong").expect("pong endpoint not found");
         let mut tag = 100;
         loop {
-            let reply = ipc::call(ep, ipc::Message::new(tag));
+            let reply = ipc::call(ep, ipc::Message::new(tag)).unwrap_or_else(|_| ipc::Message::default());
             crate::serial_println!("[ping] sent {}, got reply {}", tag, reply.tag);
             tag += 100;
             for _ in 0..50 {

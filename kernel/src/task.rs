@@ -290,12 +290,27 @@ impl Task {
 }
 
 /// Spawn a new kernel task and add it to the run queue. Safe to call both
-/// during init (before the scheduler runs) and from a running task.
+/// Add a task to the scheduler, reusing a `Dead` slot if available.
+/// Returns the index where the task was placed.
+pub fn add_task(task: Task) -> usize {
+    scheduler::with(|s| {
+        // Scan for a dead slot to reuse.
+        if let Some(idx) = s.tasks.iter().position(|t| t.state == State::Dead) {
+            s.tasks[idx] = Box::new(task);
+            idx
+        } else {
+            s.tasks.push(Box::new(task));
+            s.tasks.len() - 1
+        }
+    })
+}
+
+/// Spawn a kernel task (ring 0). Returns the new task's ID.
 pub fn spawn_kernel_task(name: &str, entry: extern "C" fn() -> !) -> u64 {
     let task = Task::new(name, entry);
     let id = task.id;
     crate::fs::init_task_fds(id as u32);
-    scheduler::with(|s| s.tasks.push(Box::new(task)));
+    add_task(task);
     serial_println!("task :: spawned '{}' (id {})", name, id);
     id
 }
@@ -430,7 +445,7 @@ fn spawn_user_from_entry(
 
     let task_id = task.id;
     crate::fs::init_task_fds(task_id as u32);
-    scheduler::with(|s| s.tasks.push(Box::new(task)));
+    add_task(task);
     serial_println!("task :: spawned user task '{}' (id {})", name, task_id);
 
     Ok(task_id)
@@ -844,7 +859,12 @@ pub fn do_fork(frame: &crate::syscall::SyscallFrame) -> u64 {
 
     // 6. Register the child and record it on the parent.
     scheduler::with(|s| {
-        s.tasks.push(Box::new(child));
+        // Reuse a dead slot if available, otherwise push.
+        if let Some(idx) = s.tasks.iter().position(|t| t.state == State::Dead) {
+            s.tasks[idx] = Box::new(child);
+        } else {
+            s.tasks.push(Box::new(child));
+        }
         if let Some(p) = s.tasks.iter_mut().find(|t| t.id == parent_id) {
             p.children.push(child_id);
         }

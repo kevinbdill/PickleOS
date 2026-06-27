@@ -596,7 +596,7 @@ fn execute(cmd: &str, input: Option<&str>) {
             let n: u64 = rest.parse().unwrap_or(7);
             match crate::ipc::lookup("demo.pong") {
                 Some(ep) => {
-                    let reply = crate::ipc::call(ep, crate::ipc::Message::new(n));
+                    let reply = crate::ipc::call(ep, crate::ipc::Message::new(n)).unwrap_or_else(|_| crate::ipc::Message::default());
                     println!("demo.pong replied with tag {}", reply.tag);
                 }
                 None => println!("demo.pong endpoint not registered yet"),

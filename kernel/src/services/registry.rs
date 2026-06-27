@@ -85,7 +85,7 @@ pub extern "C" fn registry_server_task() -> ! {
 fn request(req: RegRequest) -> Option<RegResponse> {
     let ep = ipc::lookup(REGISTRY_ENDPOINT)?;
     let req_ptr = Box::into_raw(Box::new(req)) as u64;
-    let reply = ipc::call(ep, Message::with_words(TAG_REG, [req_ptr, 0, 0, 0, 0, 0]));
+    let reply = ipc::call(ep, Message::with_words(TAG_REG, [req_ptr, 0, 0, 0, 0, 0])).unwrap_or_else(|_| Message::default());
     let resp_ptr = reply.words[0] as *mut RegResponse;
     if resp_ptr.is_null() {
         return None;

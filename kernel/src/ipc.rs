@@ -47,6 +47,15 @@ impl Message {
         }
     }
 
+    /// A zeroed-out message, suitable as a default/fallback.
+    pub fn default() -> Self {
+        Message {
+            tag: 0,
+            words: [0; 6],
+            sender: 0,
+        }
+    }
+
     /// Construct a message with a tag and explicit data words.
     pub fn with_words(tag: u64, words: [u64; 6]) -> Self {
         Message {
@@ -214,7 +223,8 @@ pub fn receive(ep: EndpointId) -> Message {
 
 /// RPC: send `msg` to `ep` and block until the peer [`reply`]s, returning the
 /// reply. This is the request/response pattern services expose to clients.
-pub fn call(ep: EndpointId, mut msg: Message) -> Message {
+/// Returns `Err(())` if the reply does not arrive within ~1 second.
+pub fn call(ep: EndpointId, mut msg: Message) -> Result<Message, ()> {
     let me = task::current_id();
     msg.sender = me;
 
@@ -233,20 +243,42 @@ pub fn call(ep: EndpointId, mut msg: Message) -> Message {
         task::unblock(w);
     }
 
-    // Wait for the reply.
+    // Deadline: roughly 1 second from now (1 ms per tick).
+    let deadline = task::scheduler::ticks() + 500;
+
+    // Wait for the reply, with a timeout.
     loop {
         let reply = with_state(|s| match s.replies.get(&me) {
             Some(Some(_)) => s.replies.remove(&me).flatten(),
             _ => None,
         });
         if let Some(r) = reply {
-            return r;
+            return Ok(r);
         }
+
+        // Check timeout before blocking.
+        if task::scheduler::ticks() >= deadline {
+            // Clean up our reply slot so we don't leak it.
+            with_state(|s| {
+                s.replies.remove(&me);
+            });
+            return Err(());
+        }
+
+        // Re-enable interrupts so the timer tick can fire and other tasks
+        // can run while we wait. Without this, no timer interrupt would
+        // arrive and the deadline check would never pass.
+        x86_64::instructions::interrupts::enable();
+
         task::scheduler::with(|sch| {
             let cur = sch.current;
             sch.tasks[cur].state = task::State::Blocked;
         });
         task::scheduler::schedule();
+
+        // Disable interrupts again before the next iteration (with_state
+        // and the scheduler lock both expect interrupts disabled).
+        x86_64::instructions::interrupts::disable();
     }
 }
 

@@ -24,6 +24,7 @@
 use crate::task;
 use crate::{print, serial_print, serial_println};
 use core::arch::asm;
+use x86_64::structures::paging::OffsetPageTable;
 
 // --- Syscall numbers -------------------------------------------------------
 pub const SYS_PRINT: u64 = 1; // (ptr, len) -> bytes written
@@ -270,11 +271,18 @@ fn sys_mmap_impl(addr: u64, len: usize, _prot: u32) -> Result<usize, ()> {
 
 /// Implementation of memory unmapping for user processes.
 fn sys_munmap_impl(addr: u64, len: usize) -> Result<(), ()> {
-    use x86_64::structures::paging::{Mapper, Page, Size4KiB};
+    use x86_64::structures::paging::{Mapper, Page, PageTable, PageTableFlags, Size4KiB, Translate};
+    use x86_64::structures::paging::mapper::TranslateResult;
     use x86_64::VirtAddr;
     
     if len == 0 {
         return Ok(());
+    }
+    
+    // Validate address is in user space range (must be >= USER_HEAP_START
+    // and below the canonical user/kernel boundary).
+    if addr < crate::memory::USER_HEAP_START || addr >= 0x0000_8000_0000_0000 {
+        return Err(());
     }
     
     // Round up to page size
@@ -288,14 +296,35 @@ fn sys_munmap_impl(addr: u64, len: usize) -> Result<(), ()> {
     if user_cr3.is_none() {
         return Err(());
     }
+    let user_cr3 = user_cr3.unwrap();
     
-    // Unmap pages
+    // Validate via the user's own page table: build a temporary mapper over
+    // the task's L4 table so we check the *user's* mappings, not the kernel's.
     crate::memory::with_memory(|mem| {
+        let offset = mem.physical_memory_offset;
+        let l4: &mut PageTable = unsafe {
+            &mut *((offset + user_cr3.as_u64()).as_mut_ptr::<PageTable>())
+        };
+        let mut user_mapper = unsafe { OffsetPageTable::new(l4, offset) };
         let start_page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
         
         for i in 0..page_count {
             let page = start_page + i as u64;
-            let (_frame, flush) = mem.mapper.unmap(page).map_err(|_| ())?;
+            // Verify the page is actually mapped in the user's page table
+            // and is user-accessible (USER_ACCESSIBLE flag set).
+            let entry = match user_mapper.translate(page.start_address()) {
+                TranslateResult::Mapped { flags, .. } => flags,
+                _ => return Err(()),
+            };
+            if !entry.contains(PageTableFlags::USER_ACCESSIBLE) {
+                return Err(());
+            }
+        }
+        
+        // All pages validated — now unmap from the user's page table.
+        for i in 0..page_count {
+            let page = start_page + i as u64;
+            let (_frame, flush) = user_mapper.unmap(page).map_err(|_| ())?;
             flush.flush();
         }
         
