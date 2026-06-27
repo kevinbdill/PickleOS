@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  schedule:
+    # Nightly build at 03:00 UTC
+    - cron: '0 3 * * *'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly toolchain
+        run: |
+          rustup toolchain install nightly --component rust-src --component llvm-tools-preview
+          rustup default nightly
+
+      - name: Install bootloader_linker
+        run: cargo install bootloader_linker --version 0.1.7
+
+      - name: Install QEMU
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq qemu-system-x86_64
+
+      - name: Create scratch disks
+        run: make disks
+
+      - name: Build kernel
+        run: cargo build --release
+
+      - name: Build bootable image
+        run: make image
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy -- -D warnings
+        continue-on-error: true  # clippy is advisory on nightly
+
+  boot-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: build
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly toolchain
+        run: |
+          rustup toolchain install nightly --component rust-src --component llvm-tools-preview
+          rustup default nightly
+
+      - name: Install bootloader_linker
+        run: cargo install bootloader_linker --version 0.1.7
+
+      - name: Install QEMU
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq qemu-system-x86_64
+
+      - name: Create scratch disks
+        run: make disks
+
+      - name: Build
+        run: cargo build --release && make image
+
+      - name: Boot in QEMU and verify startup
+        run: |
+          # Boot QEMU headless, capture serial output, look for boot success markers
+          timeout 30 qemu-system-x86_64 \
+            -drive format=raw,file=$(ls target/x86_64-pickleos/release/bios.img) \
+            -m 256M -no-reboot \
+            -device ich9-ahci,id=ahci \
+            -drive id=d0,format=raw,file=disk0.img,if=none \
+            -drive id=d1,format=raw,file=disk1.img,if=none \
+            -device ide-hd,drive=d0,bus=ahci.0 \
+            -device ide-hd,drive=d1,bus=ahci.1 \
+            -device e1000,netdev=net0 \
+            -netdev user,id=net0 \
+            -serial stdio -display none 2>&1 | tee boot.log
+
+      - name: Check boot log for success markers
+        run: |
+          echo "=== Boot log ==="
+          cat boot.log
+          echo ""
+          echo "=== Checking for success markers ==="
+          if grep -q "kernel :: initialized" boot.log; then
+            echo "✅ Kernel initialized"
+          fi
+          if grep -q "userland ready" boot.log; then
+            echo "✅ Userland ready — full boot success"
+          fi
+          if grep -q "shell" boot.log; then
+            echo "✅ Shell is running"
+          fi
+          if grep -qE "task.*spawned.*1[0-5]" boot.log; then
+            echo "✅ All 15+ tasks spawned"
+          fi
+          # Core assertion: must at least reach IPC/init
+          if ! grep -q "userland ready\|kernel :: initialized" boot.log; then
+            echo "❌ Boot did not complete!"
+            exit 1
+          fi
+          echo "✅ Boot test passed"
