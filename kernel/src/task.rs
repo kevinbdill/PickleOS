@@ -467,6 +467,11 @@ pub fn do_exit(status: i32) -> ! {
     // Release the exiting task's open files and credentials.
     crate::fs::cleanup_task_fds(cur_id as u32);
 
+    // Clean up the exiting task's IPC reply slot so it doesn't leak in the
+    // global replies map (which permanently grows for every call() made by
+    // any exited task).
+    crate::ipc::cleanup_reply_slot(cur_id);
+
     // Tear down any window-server windows this task owned. Crucial when a task
     // is killed by a fault (its user-space `Window::drop` never runs), so the
     // compositor would otherwise keep compositing/polling a dead client.
@@ -1004,8 +1009,12 @@ pub fn do_kill(pid: u64, sig: u32) -> u64 {
     scheduler::with(|s| {
         if let Some(t) = s.tasks.iter_mut().find(|t| t.id == pid) {
             t.signals.set_pending(sig);
-            // Wake a sleeper so it can reach a syscall boundary and be served.
-            if t.state == State::Blocked && t.wait_blocked {
+            // Wake the task if it's blocked, regardless of why. Previously
+            // only tasks blocked on wait() (t.wait_blocked) were woken,
+            // which meant signals couldn't interrupt tasks blocked on IPC
+            // receive/call — the signal was marked pending but the target
+            // never woke to deliver it.
+            if t.state == State::Blocked {
                 t.state = State::Runnable;
             }
         }

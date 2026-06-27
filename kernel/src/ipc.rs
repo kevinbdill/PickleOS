@@ -180,6 +180,13 @@ pub fn receive(ep: EndpointId) -> Message {
                     s.replies.insert(me, Some(m));
                     return Some(());
                 }
+                // Remove any stale entry for this task before pushing.
+                // On a spurious wake (e.g. from a signal or timeout) we
+                // loop back here and would otherwise accumulate duplicates
+                // in the waiters list, causing unbounded growth and
+                // potentially waking the same task multiple times for
+                // one message.
+                endpoint.waiters.retain(|&w| w != me);
                 endpoint.waiters.push_back(me);
             }
             None::<()>
@@ -241,6 +248,17 @@ pub fn call(ep: EndpointId, mut msg: Message) -> Message {
         });
         task::scheduler::schedule();
     }
+}
+
+/// Remove a task's reply slot from the global replies map.
+///
+/// Called from [`crate::task::do_exit`] so that every exited task's
+/// pending-reply slot is cleaned up, preventing a slow memory leak
+/// in the `replies` map.
+pub fn cleanup_reply_slot(task_id: u64) {
+    with_state(|s| {
+        s.replies.remove(&task_id);
+    });
 }
 
 /// Reply to a message previously received via [`call`]. Delivers `reply_msg` to
