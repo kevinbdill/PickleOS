@@ -166,6 +166,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // basic services (ICMP ping responder, TCP echo server on port 7).
     task::spawn_kernel_task("net-demo", net::demo::network_demo_task);
 
+    // Mint role capabilities for init (PID 1) so it can exercise the full set
+    // of syscalls. In production, these would be granted selectively.
+    // The init task is the only kernel task that gets its role caps minted here;
+    // other kernel tasks (shell, drivers, etc.) mint their own device- and
+    // endpoint-specific capabilities inline (see shell.rs, driver/keyboard.rs, etc.).
+    {
+        use crate::capability::{self, Object, Rights};
+        capability::create_table(init_id);
+        capability::mint(init_id, Object::Role(capability::ROLE_SPAWN), Rights::ALL);
+        capability::mint(init_id, Object::Role(capability::ROLE_FILE_SYSTEM), Rights::ALL);
+        capability::mint(init_id, Object::Role(capability::ROLE_KILL), Rights::ALL);
+        capability::mint(init_id, Object::Role(capability::ROLE_NETWORK), Rights::ALL);
+        capability::mint(init_id, Object::Role(capability::ROLE_WINDOW_SERVER), Rights::ALL);
+    }
+
     // User-space programs are no longer hard-coded here. Once the AHCI/NextFS
     // bring-up task finishes mounting the filesystem, it hands control to
     // `init_user::run()`, which seeds `/bin` from the embedded images, writes

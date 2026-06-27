@@ -77,6 +77,7 @@ pub const SYS_ACCEPT: u64 = 43; // (sockfd, addr_ptr, addrlen_ptr) -> new_fd or 
 pub const SYS_SEND: u64 = 44; // (sockfd, buf_ptr, len, flags) -> bytes_sent or -1
 pub const SYS_RECV: u64 = 45; // (sockfd, buf_ptr, len, flags) -> bytes_recv or -1
 pub const SYS_SHUTDOWN: u64 = 46; // (sockfd, how) -> 0 or -1
+pub const SYS_CAP_GRANT: u64 = 47; // (target_pid, slot, rights) -> new_slot or u64::MAX
 
 /// Snapshot of the caller's general-purpose registers, built by [`syscall_stub`].
 /// Field order MUST match the push order in the assembly stub (last pushed =
@@ -390,12 +391,32 @@ fn syscall_dispatch_inner(f: &mut SyscallFrame) -> u64 {
         }
         SYS_TICKS => task::scheduler::ticks(),
         SYS_IPC_SEND => {
-            crate::ipc::send(a0, crate::ipc::Message::new(a1));
-            0
+            // a0 = endpoint id, a1 = message tag
+            // Check: caller must hold a cap with SEND rights for this endpoint.
+            let caller = task::current_id();
+            if !crate::capability::find_object(caller, crate::capability::Rights::SEND, |obj| {
+                matches!(obj, crate::capability::Object::Endpoint(e) if *e == a0)
+            }).is_some() {
+                serial_println!("[syscall] SYS_IPC_SEND: no capability for endpoint {}", a0);
+                u64::MAX
+            } else {
+                crate::ipc::send(a0, crate::ipc::Message::new(a1));
+                0
+            }
         }
         SYS_IPC_RECV => {
-            let msg = crate::ipc::receive(a0);
-            msg.tag
+            // a0 = endpoint id
+            // Check: caller must hold a cap with RECV rights for this endpoint.
+            let caller = task::current_id();
+            if !crate::capability::find_object(caller, crate::capability::Rights::RECV, |obj| {
+                matches!(obj, crate::capability::Object::Endpoint(e) if *e == a0)
+            }).is_some() {
+                serial_println!("[syscall] SYS_IPC_RECV: no capability for endpoint {}", a0);
+                u64::MAX
+            } else {
+                let msg = crate::ipc::receive(a0);
+                msg.tag
+            }
         }
         SYS_CAP_CHECK => {
             let id = task::current_id();
@@ -409,6 +430,12 @@ fn syscall_dispatch_inner(f: &mut SyscallFrame) -> u64 {
         }
         SYS_SPAWN => {
             // a0 = pointer to ELF binary, a1 = length, a2 = pointer to name string
+            // Check: caller must hold a ROLE_SPAWN capability.
+            let caller = task::current_id();
+            if !crate::capability::check_role(caller, crate::capability::ROLE_SPAWN, crate::capability::Rights::SEND) {
+                serial_println!("[syscall] SYS_SPAWN: no SPAWN capability for task {}", caller);
+                return u64::MAX;
+            }
             let current_ring = task::scheduler::with(|s| s.tasks[s.current].ring);
             if current_ring == task::Ring::User {
                 if !is_user_pointer(a0, a1 as usize) {
@@ -456,6 +483,12 @@ fn syscall_dispatch_inner(f: &mut SyscallFrame) -> u64 {
         }
         SYS_OPEN => {
             // a0 = path_ptr, a1 = path_len, a2 = flags
+            // Check: caller must hold a ROLE_FILE_SYSTEM capability to open files.
+            let caller = task::current_id();
+            if !crate::capability::check_role(caller, crate::capability::ROLE_FILE_SYSTEM, crate::capability::Rights::SEND) {
+                serial_println!("[syscall] SYS_OPEN: no FILE_SYSTEM capability for task {}", caller);
+                return u64::MAX;
+            }
             let current_ring = task::scheduler::with(|s| s.tasks[s.current].ring);
             if current_ring == task::Ring::User && !is_user_pointer(a0, a1 as usize) {
                 serial_println!("[syscall] SYS_OPEN: invalid user pointer {:#x}", a0);
@@ -708,6 +741,12 @@ fn syscall_dispatch_inner(f: &mut SyscallFrame) -> u64 {
             // with the ELF at `path`, preserving PID/parent/fds. On success it
             // does not return to the caller (frame is rewritten to the new entry
             // point); on failure it returns u64::MAX.
+            // Check: caller must hold a ROLE_FILE_SYSTEM capability to exec from filesystem.
+            let exec_caller = task::current_id();
+            if !crate::capability::check_role(exec_caller, crate::capability::ROLE_FILE_SYSTEM, crate::capability::Rights::SEND) {
+                serial_println!("[syscall] SYS_EXEC: no FILE_SYSTEM capability for task {}", exec_caller);
+                return u64::MAX;
+            }
             let a3 = f.r10;
             let current_ring = task::scheduler::with(|s| s.tasks[s.current].ring);
             if current_ring == task::Ring::User && !is_user_pointer(a0, a1 as usize) {
@@ -734,7 +773,14 @@ fn syscall_dispatch_inner(f: &mut SyscallFrame) -> u64 {
             // table, assigns a new PID to the child, and registers it as a
             // child of the parent. Returns the child's PID in the parent and 0
             // in the child. Returns u64::MAX on error.
-            task::do_fork(f)
+            // Check: caller must hold a ROLE_SPAWN capability (fork creates a new task).
+            let fork_caller = task::current_id();
+            if !crate::capability::check_role(fork_caller, crate::capability::ROLE_SPAWN, crate::capability::Rights::SEND) {
+                serial_println!("[syscall] SYS_FORK: no SPAWN capability for task {}", fork_caller);
+                u64::MAX
+            } else {
+                task::do_fork(f)
+            }
         }
         SYS_PIPE => {
             // a0 = pointer to an array of two u32 the kernel fills with
@@ -762,13 +808,27 @@ fn syscall_dispatch_inner(f: &mut SyscallFrame) -> u64 {
         SYS_KILL => {
             // a0 = target pid, a1 = signal number. Returns 0 on success,
             // u64::MAX if the target does not exist or the signal is invalid.
-            task::do_kill(a0, a1 as u32)
+            // Check: caller must hold a ROLE_KILL capability.
+            let caller = task::current_id();
+            if !crate::capability::check_role(caller, crate::capability::ROLE_KILL, crate::capability::Rights::SEND) {
+                serial_println!("[syscall] SYS_KILL: no KILL capability for task {}", caller);
+                u64::MAX
+            } else {
+                task::do_kill(a0, a1 as u32)
+            }
         }
         SYS_SIGNAL => {
             // a0 = signal number, a1 = handler (user fn ptr; 0=SIG_DFL, 1=SIG_IGN),
             // a2 = restorer trampoline (user code that issues SYS_SIGRETURN).
             // Returns the previous handler, or u64::MAX on error.
-            task::do_signal(a0 as u32, a1, a2)
+            // Check: caller must hold a ROLE_KILL capability (signal/kill privilege).
+            let caller = task::current_id();
+            if !crate::capability::check_role(caller, crate::capability::ROLE_KILL, crate::capability::Rights::SEND) {
+                serial_println!("[syscall] SYS_SIGNAL: no KILL capability for task {}", caller);
+                u64::MAX
+            } else {
+                task::do_signal(a0 as u32, a1, a2)
+            }
         }
         SYS_SIGRETURN => {
             // Restore the context saved when a signal handler was entered. The
@@ -883,6 +943,12 @@ fn syscall_dispatch_inner(f: &mut SyscallFrame) -> u64 {
         SYS_SOCKET => {
             // a0 = domain (AF_INET=2), a1 = type (SOCK_STREAM=1), a2 = protocol (0=auto).
             // Returns fd or -1 on error.
+            // Check: caller must hold a ROLE_NETWORK capability.
+            let net_caller = task::current_id();
+            if !crate::capability::check_role(net_caller, crate::capability::ROLE_NETWORK, crate::capability::Rights::SEND) {
+                serial_println!("[syscall] SYS_SOCKET: no NETWORK capability for task {}", net_caller);
+                return u64::MAX;
+            }
             const AF_INET: u64 = 2;
             const SOCK_STREAM: u64 = 1;
             
@@ -1124,6 +1190,29 @@ fn syscall_dispatch_inner(f: &mut SyscallFrame) -> u64 {
                     }
                 }
                 None => u64::MAX,
+            }
+        }
+        SYS_CAP_GRANT => {
+            // a0 = target_pid, a1 = slot (in caller's cap table), a2 = rights (bitfield).
+            // Grants a capability from the caller's slot to the target task,
+            // with rights clamped by the source's GRANT right.
+            // Returns the new cap slot in the target's table, or u64::MAX on failure.
+            let grant_caller = task::current_id();
+            let target = a0;
+            let slot = a1 as usize;
+            let new_rights = crate::capability::Rights(a2 as u32);
+            // Verify that the caller holds a cap with GRANT right in the specified slot.
+            if !crate::capability::check(grant_caller, slot, crate::capability::Rights::GRANT) {
+                serial_println!("[syscall] SYS_CAP_GRANT: caller {} no GRANT right on slot {}", grant_caller, slot);
+                u64::MAX
+            } else {
+                match crate::capability::grant(grant_caller, slot, target, new_rights) {
+                    Some(new_slot) => new_slot as u64,
+                    None => {
+                        serial_println!("[syscall] SYS_CAP_GRANT: grant failed (from {} slot {} to {})", grant_caller, slot, target);
+                        u64::MAX
+                    }
+                }
             }
         }
         other => {

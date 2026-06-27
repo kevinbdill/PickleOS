@@ -39,6 +39,16 @@ pub enum Object {
     /// A driver holding this cap can read/write the region; the kernel maps it
     /// with cache-disable + write-through flags so MMIO semantics are preserved.
     Mmio { phys_base: u64, len: u64 },
+    /// A named role/right for ambient authority that doesn't map to a concrete
+    /// kernel object — e.g. SPAWN, KILL, FILE_SYSTEM, NETWORK. The u64 is a
+    /// role identifier assigned by convention:
+    ///   1 = SPAWN
+    ///   2 = FILE_SYSTEM
+    ///   3 = SYS_KILL
+    ///   4 = NETWORK
+    ///   5 = WINDOW_SERVER
+    /// Tasks minted at boot get these roles; user tasks must be granted them.
+    Role(u64),
 }
 
 /// Access rights carried by a capability. Implemented as a simple bitset.
@@ -68,6 +78,13 @@ impl Rights {
         (self.0 & needed.0) == needed.0
     }
 }
+
+// Role identifiers used with Object::Role for ambient-rights checking.
+pub const ROLE_SPAWN: u64 = 1;
+pub const ROLE_FILE_SYSTEM: u64 = 2;
+pub const ROLE_KILL: u64 = 3;
+pub const ROLE_NETWORK: u64 = 4;
+pub const ROLE_WINDOW_SERVER: u64 = 5;
 
 /// A single capability: an object + the rights the holder has over it.
 #[derive(Debug, Clone, Copy)]
@@ -170,6 +187,13 @@ pub fn check(task_id: u64, slot: usize, needed: Rights) -> bool {
         Some(cap) => cap.rights.contains(needed),
         None => false,
     }
+}
+
+/// Check that `task_id` holds a capability for a given `role` (see
+/// [`Object::Role`]) with at least `needed` rights. Convenience wrapper around
+/// [`find_object`].
+pub fn check_role(task_id: u64, role: u64, needed: Rights) -> bool {
+    find_object(task_id, needed, |obj| matches!(obj, Object::Role(r) if *r == role)).is_some()
 }
 
 /// **Capability derivation / grant.** Copy the capability in `from_slot` of

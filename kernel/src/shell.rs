@@ -328,6 +328,13 @@ pub extern "C" fn shell_task() -> ! {
                 .union(crate::capability::Rights::GRANT),
         );
     }
+    // Mint role capabilities so the shell can exercise SYS_KILL, SYS_SPAWN,
+    // SYS_OPEN, SYS_SOCKET, etc. during interactive use.
+    crate::capability::mint(me, crate::capability::Object::Role(crate::capability::ROLE_SPAWN), crate::capability::Rights::ALL);
+    crate::capability::mint(me, crate::capability::Object::Role(crate::capability::ROLE_FILE_SYSTEM), crate::capability::Rights::ALL);
+    crate::capability::mint(me, crate::capability::Object::Role(crate::capability::ROLE_KILL), crate::capability::Rights::ALL);
+    crate::capability::mint(me, crate::capability::Object::Role(crate::capability::ROLE_NETWORK), crate::capability::Rights::ALL);
+    crate::capability::mint(me, crate::capability::Object::Role(crate::capability::ROLE_WINDOW_SERVER), crate::capability::Rights::ALL);
 
     // Wait briefly for the GUI compositor to take over the screen and route
     // console output into the on-screen Terminal window, so the banner/prompt
