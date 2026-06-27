@@ -567,7 +567,10 @@ pub extern "C" fn compositor_task() -> ! {
                 let ch = ch as i32;
                 let n = client_window_count(&windows) as i32;
                 let wx = (360 + 26 * n).clamp(0, screen_w - cw.max(1));
-                let wy = (180 + 26 * n).clamp(0, screen_h - TITLE_H);
+                // Ceiling: ensure the full window (title bar + client area)
+                // fits on screen. Total window height = TITLE_H + ch.
+                let total_h = TITLE_H + ch;
+                let wy = (180 + 26 * n).clamp(0, (screen_h - TASKBAR_H).max(0) - total_h);
                 let win = Window::new_client(wx, wy, cw, ch, &title, Color(0x2A7AB0), id);
                 windows.push(win);
                 focus = windows.len() - 1;
@@ -603,8 +606,13 @@ pub extern "C" fn compositor_task() -> ! {
                 if m.left {
                     // Continue dragging the focused (topmost) window.
                     let win = windows.last_mut().unwrap();
+                    // Clamp x to stay on screen horizontally.
                     win.x = (cx - ox).clamp(0, screen_w - win.w);
-                    win.y = (cy - oy).clamp(0, screen_h - TITLE_H);
+                    // Clamp y so the title bar stays within view and
+                    // the window's bottom edge stays above the taskbar.
+                    let min_y = 0i32;
+                    let max_y = (screen_h - TASKBAR_H).max(0) - win.h;
+                    win.y = (cy - oy).clamp(min_y, max_y);
                     // Keep the window server's notion of the client-area origin
                     // in sync so event coordinates stay correct while dragging.
                     if win.kind == WindowKind::Client {
@@ -653,8 +661,19 @@ pub extern "C" fn compositor_task() -> ! {
                                 focused_client = None;
                             }
                         }
+                        let was_focused = i == focus;
                         windows.remove(i);
-                        focus = windows.len().saturating_sub(1);
+                        // After removal, the topmost window (last in vec) is
+                        // the new default focus — but only if the closed window
+                        // was the focused one. If a background window was
+                        // closed, keep the current focus (adjusted for the
+                        // shift if the removed window was *before* it).
+                        if was_focused {
+                            focus = windows.len().saturating_sub(1);
+                        } else if focus >= i {
+                            // The focused window shifted down by one.
+                            focus = focus.saturating_sub(1);
+                        }
                         scene_dirty = true;
                     } else {
                         // Raise to top (focus) by moving to the end of the vec.

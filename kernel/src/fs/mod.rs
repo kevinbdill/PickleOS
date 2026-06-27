@@ -52,45 +52,72 @@ pub use vfs::{
 use spin::Mutex;
 
 /// Global mounted filesystem (single mount point for now).
+///
+/// # Interrupt safety
+///
+/// This must NOT be accessed with a plain `.lock()` — the lock does not disable
+/// interrupts. On a single-core preemptive kernel a `spin::Mutex` deadlocks if a
+/// timer interrupt preempts the holder and the ISR or a new task tries to
+/// re-enter the same lock. Use [`lock_fs`] / [`lock_fs_mut`] instead, which
+/// disable interrupts for the duration of the critical section.
 static MOUNTED_FS: Mutex<Option<NextFS>> = Mutex::new(None);
+
+/// Lock the filesystem Mutex with interrupts disabled, and return a guard.
+///
+/// The guard automatically restores the interrupt flag when dropped, so
+/// interrupts are re-enabled once the caller is done with the filesystem.
+/// This is safe because `spin::MutexGuard` on single-core is not `Send`, so
+/// the guard cannot leak across scheduler ticks even with the IRQ state
+/// mediation that `without_interrupts` provides.
+fn lock_fs() -> spin::MutexGuard<'static, Option<NextFS>> {
+    x86_64::instructions::interrupts::without_interrupts(|| MOUNTED_FS.lock())
+}
 
 /// Mount a NextFS from the given block device index.
 pub fn mount(dev_idx: usize) -> Result<(), FsError> {
     let fs = NextFS::mount(dev_idx)?;
-    *MOUNTED_FS.lock() = Some(fs);
+    *lock_fs() = Some(fs);
     Ok(())
 }
 
 /// Unmount the current filesystem.
 pub fn unmount() {
-    *MOUNTED_FS.lock() = None;
+    *lock_fs() = None;
 }
 
 /// Non-blocking check for whether a filesystem is currently mounted. Uses
 /// `try_lock` so a caller (e.g. the shell's lazy history load) is never blocked
 /// while another task holds the lock for a long operation such as the
 /// first-boot format/self-test. Returns `false` if the lock is contended.
+///
+/// This is inherently racy (the result is stale by the time the caller reads
+/// it), but it is only used as a best-effort hint. It *does* disable interrupts
+/// during the try_lock to avoid a preempted holding task causing a deadlock.
 pub fn is_mounted() -> bool {
-    MOUNTED_FS
-        .try_lock()
-        .map(|g| g.is_some())
-        .unwrap_or(false)
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        MOUNTED_FS
+            .try_lock()
+            .map(|g| g.is_some())
+            .unwrap_or(false)
+    })
 }
 
 /// Execute a closure with a reference to the mounted filesystem.
+/// Interrupts are disabled for the entire duration.
 pub fn with_fs<F, R>(f: F) -> R
 where
     F: FnOnce(Option<&NextFS>) -> R,
 {
-    let fs_guard = MOUNTED_FS.lock();
+    let fs_guard = lock_fs();
     f(fs_guard.as_ref())
 }
 
 /// Execute a closure with a mutable reference to the mounted filesystem.
+/// Interrupts are disabled for the entire duration.
 pub fn with_fs_mut<F, R>(f: F) -> R
 where
     F: FnOnce(Option<&mut NextFS>) -> R,
 {
-    let mut fs_guard = MOUNTED_FS.lock();
+    let mut fs_guard = lock_fs();
     f(fs_guard.as_mut())
 }

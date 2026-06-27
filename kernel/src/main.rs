@@ -295,6 +295,7 @@ mod demo {
 fn panic(info: &PanicInfo) -> ! {
     println!("\n*** KERNEL PANIC ***\n{}", info);
     serial_println!("\n*** KERNEL PANIC ***\n{}", info);
+    print_backtrace();
     hlt_loop();
 }
 
@@ -303,5 +304,38 @@ fn panic(info: &PanicInfo) -> ! {
 pub fn hlt_loop() -> ! {
     loop {
         x86_64::instructions::hlt();
+    }
+}
+
+/// Print a stack backtrace by walking the RBP-linked list.
+///
+/// In x86_64 System V ABI, `rbp` points to a saved `rbp` at `[rbp + 0]` and
+/// the return address is at `[rbp + 8]`. A sentinel frame has `rbp = 0`.
+/// If rbp is not chained (compiler omitted frame pointers), this prints nothing.
+pub fn print_backtrace() {
+    serial_println!("\n[backtrace]");
+    // Read rbp via inline asm.
+    let rbp: u64;
+    unsafe {
+        core::arch::asm!("mov {}, rbp", out(reg) rbp);
+    }
+    let mut fp = rbp;
+    let mut i = 0usize;
+    while fp != 0 && i < 32 {
+        // Read saved frame pointer and return address from the stack.
+        // Safety: these are kernel-owned stack frames; if the kernel has
+        // corrupted its own stack this can fault — but we're already panicking.
+        let saved_fp: u64;
+        let ret_addr: u64;
+        unsafe {
+            saved_fp = core::ptr::read_volatile(fp as *const u64);
+            ret_addr = core::ptr::read_volatile((fp + 8) as *const u64);
+        }
+        if ret_addr == 0 {
+            break;
+        }
+        serial_println!("  #{}: {:#018x}", i, ret_addr);
+        fp = saved_fp;
+        i += 1;
     }
 }

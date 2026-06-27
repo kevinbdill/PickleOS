@@ -75,12 +75,14 @@ pickleos/
 
 PickleOS is a real working kernel — it boots, runs a GUI, networks, and stores files. It's not production-ready (yet). The gap is measured in engineer-years.
 
-**Phase 1 — Critical Stability (current):**
-1. Fix NextFS concurrency race
-2. Fix window Z-order bug
-3. Remove hard-coded 320×240 window ceiling
-4. Build test harness + CI
-5. Kernel panic → serial backtrace + 24h soak test
+**Phase 1 — Critical Stability (current):**  
+✅ **✓** Fix NextFS concurrency race — interrupt-safe lock prevents deadlock when preempted during block I/O  
+✅ **✓** Fix window Z-order bug — close handler preserves focus; background-window close no longer steals focus  
+✅ **✓** Fix drag ceiling — windows can't be dragged below taskbar; new windows respect screen bounds  
+✅ **✓** Kernel panic backtrace — frames printed via RBP chain on any panic  
+✅ **✓** Lock ordering audit — PIPES vs FD_TABLES now consistent (FD_TABLES → PIPES, never reversed)  
+4. Build test harness + CI  
+5. 24h soak test  
 
 See [`docs/PRODUCTION_ROADMAP.md`](docs/PRODUCTION_ROADMAP.md) for the full gap analysis.
 

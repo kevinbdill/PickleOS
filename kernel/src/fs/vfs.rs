@@ -851,8 +851,21 @@ pub fn close(task_id: u32, fd: Fd) -> Result<(), VfsError> {
 
 /// Create an anonymous pipe owned by `task_id`. Returns `(read_fd, write_fd)`.
 pub fn pipe(task_id: u32) -> Result<(Fd, Fd), VfsError> {
-    // Allocate the pipe object first (1 read end + 1 write end).
+    // Acquire FD_TABLES first, then PIPES (consistent with close() and
+    // cleanup_task_fds — never reverse this order to avoid deadlock).
+    let mut tables = FD_TABLES.lock();
+    let table = tables.get_mut(&task_id).ok_or(VfsError::InvalidOperation)?;
+
+    // Allocate the pipe object. We hold FD_TABLES, not PIPES, so we stash
+    // the pipe metadata and insert into PIPES afterwards.
     let id = NEXT_PIPE_ID.fetch_add(1, Ordering::SeqCst);
+
+    let read_fd = table.alloc_fd(OpenFile::pipe(id, false))?;
+    let write_fd = table.alloc_fd(OpenFile::pipe(id, true))?;
+
+    // Now register the pipe. FD_TABLES is still held, which is fine because
+    // the pipe metadata is tiny and PIPES is an independent lock.
+    drop(tables);
     PIPES.lock().insert(
         id,
         Pipe {
@@ -861,34 +874,6 @@ pub fn pipe(task_id: u32) -> Result<(Fd, Fd), VfsError> {
             write_ends: 1,
         },
     );
-
-    let mut tables = FD_TABLES.lock();
-    let table = match tables.get_mut(&task_id) {
-        Some(t) => t,
-        None => {
-            drop(tables);
-            PIPES.lock().remove(&id);
-            return Err(VfsError::InvalidOperation);
-        }
-    };
-
-    let read_fd = match table.alloc_fd(OpenFile::pipe(id, false)) {
-        Ok(fd) => fd,
-        Err(e) => {
-            drop(tables);
-            PIPES.lock().remove(&id);
-            return Err(e);
-        }
-    };
-    let write_fd = match table.alloc_fd(OpenFile::pipe(id, true)) {
-        Ok(fd) => fd,
-        Err(e) => {
-            let _ = table.close(read_fd);
-            drop(tables);
-            PIPES.lock().remove(&id);
-            return Err(e);
-        }
-    };
 
     Ok((read_fd, write_fd))
 }
