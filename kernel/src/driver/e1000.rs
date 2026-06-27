@@ -350,8 +350,13 @@ impl E1000 {
             return None; // No packet
         }
         
-        // Copy packet data
-        let len = rx_desc_slice[next_rx].length as usize;
+        // Copy packet data — clamp hardware-reported length to our buffer size
+        // to prevent an attacker-controlled NIC from causing an OOB read.
+        let raw_len = rx_desc_slice[next_rx].length as usize;
+        let len = raw_len.min(RX_BUFFER_SIZE);
+        if raw_len > RX_BUFFER_SIZE {
+            serial_println!("[e1000] RX packet length {} > buffer {}, clamped", raw_len, RX_BUFFER_SIZE);
+        }
         let buf_virt = dma::phys_to_virt(self.rx_buffers[next_rx]);
         let buf_slice = unsafe {
             core::slice::from_raw_parts(buf_virt.as_ptr::<u8>(), len)

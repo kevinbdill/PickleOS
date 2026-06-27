@@ -520,9 +520,9 @@ enum WaitScan {
 
 /// Wait for any child of the current task to terminate.
 ///
-/// Blocks until a child becomes a zombie, then reaps it (frees its slot/fds)
-/// and returns its id. If `status_ptr` is non-zero the child's exit status is
-/// written there as an `i32`. Returns `u64::MAX` if the task has no children.
+/// Wait for a child to exit. If `status_ptr` is non-zero and points to valid
+/// user-space memory, the child's exit status (an `i32`) is written there.
+/// Returns `u64::MAX` if the task has no children.
 ///
 /// The caller (syscall layer) is responsible for validating `status_ptr`.
 pub fn do_wait(status_ptr: u64) -> u64 {
@@ -556,8 +556,14 @@ pub fn do_wait(status_ptr: u64) -> u64 {
                 });
                 crate::fs::cleanup_task_fds(cid as u32);
                 if status_ptr != 0 {
-                    unsafe {
-                        *(status_ptr as *mut i32) = status;
+                    // Validate that status_ptr points to valid user memory
+                    // before writing through it.
+                    if status_ptr < 0x0000_8000_0000_0000
+                        && status_ptr.checked_add(4).map_or(false, |end| end <= 0x0000_8000_0000_0000)
+                    {
+                        unsafe {
+                            *(status_ptr as *mut i32) = status;
+                        }
                     }
                 }
                 serial_println!("[wait] reaped child {} (status {})", cid, status);
@@ -916,6 +922,29 @@ fn terminate_task(id: u64, status: i32) -> bool {
 pub fn do_kill(pid: u64, sig: u32) -> u64 {
     if sig as usize >= signal::NSIG {
         return u64::MAX;
+    }
+
+    // Permission check: a user task may only kill itself, its own children,
+    // or (if it is init/PID 1) any task. Kernel tasks bypass this check
+    // (they are trusted). This prevents an arbitrary user task from killing
+    // init or unrelated processes.
+    let current = scheduler::with(|s| {
+        let cur = s.current;
+        (cur, s.tasks[cur].id, s.tasks[cur].ring)
+    });
+    let (cur_idx, cur_id, cur_ring) = current;
+    if cur_ring == Ring::User {
+        if cur_id != pid {
+            // Not self — check if target is a child.
+            let is_child = scheduler::with(|s| {
+                s.tasks[cur_idx].children.contains(&pid)
+                    || s.tasks.iter().any(|t| t.id == pid && t.parent == Some(cur_id))
+            });
+            let is_init = cur_id == init_task_id().unwrap_or(u64::MAX);
+            if !is_child && !is_init {
+                return u64::MAX; // permission denied
+            }
+        }
     }
 
     // Look up the target's existence and its disposition for this signal.

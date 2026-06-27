@@ -134,51 +134,73 @@ pub fn lookup(name: &str) -> Option<EndpointId> {
 /// Send `msg` to an endpoint, waking one blocked receiver if present.
 /// Asynchronous: returns as soon as the message is enqueued.
 pub fn send(ep: EndpointId, mut msg: Message) {
-    interrupts::disable();
     msg.sender = task::current_id();
     let woke = with_state(|s| {
-        let endpoint = s.endpoints.get_mut(&ep).expect("send: bad endpoint");
-        endpoint.queue.push_back(msg);
-        endpoint.waiters.pop_front()
+        match s.endpoints.get_mut(&ep) {
+            Some(endpoint) => {
+                endpoint.queue.push_back(msg);
+                endpoint.waiters.pop_front()
+            }
+            None => {
+                // Silently drop messages to non-existent endpoints.
+                // The alternative (panic with disabled interrupts) would
+                // permanently deadlock the kernel on a single-CPU system.
+                None
+            }
+        }
     });
     if let Some(w) = woke {
         task::unblock(w);
     }
-    interrupts::enable();
 }
 
 /// Block until a message is available on `ep`, then return it.
 pub fn receive(ep: EndpointId) -> Message {
     loop {
-        interrupts::disable();
-        // Fast path: a message is already queued.
+        // Fast path: a message is already queued. with_state disables
+        // interrupts internally to prevent preemption during state access.
         let popped = with_state(|s| {
-            s.endpoints
-                .get_mut(&ep)
-                .expect("receive: bad endpoint")
-                .queue
-                .pop_front()
+            match s.endpoints.get_mut(&ep) {
+                Some(endpoint) => endpoint.queue.pop_front(),
+                None => None, // endpoint gone — return None (handled below)
+            }
         });
         if let Some(m) = popped {
-            interrupts::enable();
             return m;
         }
         // Slow path: register as a waiter, block, and retry when woken.
         let me = task::current_id();
         with_state(|s| {
-            s.endpoints
-                .get_mut(&ep)
-                .expect("receive: bad endpoint")
-                .waiters
-                .push_back(me);
+            if let Some(endpoint) = s.endpoints.get_mut(&ep) {
+                // Check queue again before registering (avoids lost wake-up
+                // race — a message may have arrived between the fast-path and
+                // the waiter registration).
+                if let Some(m) = endpoint.queue.pop_front() {
+                    // Store the message so we can return it after waking.
+                    s.replies.insert(me, Some(m));
+                    return Some(());
+                }
+                endpoint.waiters.push_back(me);
+            }
+            None::<()>
         });
-        // Mark blocked and switch away (interrupts stay disabled across the
-        // switch; the resume path returns here still disabled, then we loop).
-        task::scheduler::with(|sch| {
+        // Mark blocked and switch away. interrupts::without_interrupts is
+        // used because with_state already handles the IPC lock, and we
+        // need scheduler::with to also run with interrupts disabled.
+        let should_loop = task::scheduler::with(|sch| {
             let cur = sch.current;
+            // Check if we already got a message queued in replies (from
+            // the double-check above).
+            let has_reply = with_state(|s| s.replies.remove(&task::current_id()).flatten().is_some());
+            if has_reply {
+                return false; // don't block, return on next iteration
+            }
             sch.tasks[cur].state = task::State::Blocked;
+            true
         });
-        task::scheduler::schedule();
+        if should_loop {
+            task::scheduler::schedule();
+        }
         // Loop and re-check the queue.
     }
 }
@@ -186,16 +208,19 @@ pub fn receive(ep: EndpointId) -> Message {
 /// RPC: send `msg` to `ep` and block until the peer [`reply`]s, returning the
 /// reply. This is the request/response pattern services expose to clients.
 pub fn call(ep: EndpointId, mut msg: Message) -> Message {
-    interrupts::disable();
     let me = task::current_id();
     msg.sender = me;
 
     // Register a reply slot and enqueue the request, waking a receiver.
     let woke = with_state(|s| {
         s.replies.insert(me, None);
-        let endpoint = s.endpoints.get_mut(&ep).expect("call: bad endpoint");
-        endpoint.queue.push_back(msg);
-        endpoint.waiters.pop_front()
+        match s.endpoints.get_mut(&ep) {
+            Some(endpoint) => {
+                endpoint.queue.push_back(msg);
+                endpoint.waiters.pop_front()
+            }
+            None => None,
+        }
     });
     if let Some(w) = woke {
         task::unblock(w);
@@ -208,7 +233,6 @@ pub fn call(ep: EndpointId, mut msg: Message) -> Message {
             _ => None,
         });
         if let Some(r) = reply {
-            interrupts::enable();
             return r;
         }
         task::scheduler::with(|sch| {
@@ -222,7 +246,6 @@ pub fn call(ep: EndpointId, mut msg: Message) -> Message {
 /// Reply to a message previously received via [`call`]. Delivers `reply_msg` to
 /// the original caller and wakes it.
 pub fn reply(original: &Message, mut reply_msg: Message) {
-    interrupts::disable();
     reply_msg.sender = task::current_id();
     let sender = original.sender;
     let should_wake = with_state(|s| {
@@ -238,5 +261,4 @@ pub fn reply(original: &Message, mut reply_msg: Message) {
     if should_wake {
         task::unblock(sender);
     }
-    interrupts::enable();
 }

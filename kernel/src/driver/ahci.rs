@@ -546,6 +546,8 @@ fn issue_command(
             *(prd_virt.as_mut_ptr::<u32>().add(1)) = (data_phys >> 32) as u32; // DBA high
             *(prd_virt.as_mut_ptr::<u32>().add(2)) = 0; // reserved
             // DBC = byte count - 1 (bit 0 must be 1). Bit 31 (I) left clear.
+            // SAFETY: byte_count > 0 is guaranteed by the enclosing if,
+            // so (byte_count - 1) can never underflow.
             *(prd_virt.as_mut_ptr::<u32>().add(3)) = (byte_count - 1) | 1;
         }
     }
