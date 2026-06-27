@@ -177,6 +177,100 @@ pub fn kernel_rw_flags() -> PageTableFlags {
     PageTableFlags::PRESENT | PageTableFlags::WRITABLE
 }
 
+/// A stack allocated with a guard page. The guard page (one below the stack) is
+/// left **unmapped** — a stack overflow triggers a clean page fault rather than
+/// silently corrupting adjacent kernel heap data.
+///
+/// The stack occupies 33 × 4 KiB pages = 132 KiB total: 1 guard page + 32
+/// usable pages (128 KiB). This exactly matches [`crate::task::KSTACK_SIZE`].
+pub struct GuardedStack {
+    /// Base virtual address of the guard page (the stack starts at +4 KiB).
+    base: VirtAddr,
+    /// Backing physical frames so we can free them on drop.
+    frames: [PhysFrame; GUARDED_STACK_NPAGES],
+    /// Number of usable pages mapped as the stack.
+    stack_pages: u64,
+}
+
+/// Number of pages we allocate (1 guard + N stack).
+const GUARDED_STACK_NPAGES: usize = 33;
+/// How many of those are the actual usable stack.
+const GUARDED_STACK_STACK_PAGES: u64 = 32;
+
+impl GuardedStack {
+    /// Allocate a new guarded stack: 1 unmapped guard page + 32 writable pages.
+    ///
+    /// `virt_base` is the virtual address for the **guard** page (the stack
+    /// region starts at `virt_base + 0x1000`). Callers must supply unique,
+    /// non-overlapping addresses.
+    pub fn new(virt_base: VirtAddr) -> Self {
+        let mut frames: [PhysFrame; GUARDED_STACK_NPAGES] = [PhysFrame::from_start_address(PhysAddr::new(0)).unwrap(); GUARDED_STACK_NPAGES];
+
+        // Allocate all 33 physical frames first so we hold them.
+        with_memory(|mm| {
+            for i in 0..GUARDED_STACK_NPAGES {
+                frames[i] = mm.frame_allocator.allocate_frame()
+                    .expect("out of physical frames for guarded stack");
+            }
+        });
+
+        // Map the 32 stack pages (guard page stays unmapped = gap).
+        let stack_start = virt_base + 0x1000u64;
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        with_memory(|mm| {
+            for i in 0..GUARDED_STACK_STACK_PAGES as u64 {
+                let page: Page<Size4KiB> = Page::containing_address(stack_start + i * 4096u64);
+                unsafe {
+                    mm.mapper
+                        .map_to(page, frames[1 + i as usize], flags, &mut mm.frame_allocator)
+                        .expect("map_to for guarded stack failed")
+                        .flush();
+                }
+            }
+        });
+
+        GuardedStack {
+            base: virt_base,
+            frames,
+            stack_pages: GUARDED_STACK_STACK_PAGES,
+        }
+    }
+
+    /// Virtual address of the top (highest usable byte) of the stack region.
+    /// The stack grows downward from here. 16-byte aligned for System V ABI.
+    pub fn top(&self) -> VirtAddr {
+        let stack_start = self.base + 0x1000u64;
+        VirtAddr::new(stack_start.as_u64() + GUARDED_STACK_STACK_PAGES * 4096)
+    }
+
+    /// Virtual address of the bottom (lowest usable byte, start of stack area).
+    pub fn bottom(&self) -> VirtAddr {
+        self.base + 0x1000u64
+    }
+}
+
+impl Drop for GuardedStack {
+    fn drop(&mut self) {
+        // Unmap all pages: first the guard page (unmapped already but we still
+        // need to clear the PTE so nothing references the freed frames), then
+        // the stack pages.
+        with_memory(|mm| {
+            for i in 0..GUARDED_STACK_NPAGES as u64 {
+                let vaddr = self.base + i * 4096u64;
+                let page: Page<Size4KiB> = Page::containing_address(vaddr);
+                // We need mutable access to the level-4 table — unmap the page
+                // and flush TLB.
+                let (_, flush) = unsafe { mm.mapper.unmap(page).expect("unmap during GuardedStack drop") };
+                flush.flush();
+            }
+        });
+        // Physical frames are NOT freed — our BootInfoFrameAllocator is
+        // bump-style and can't reuse. This is acceptable because the total
+        // number of concurrent kernel stacks is bounded by the max task count.
+        // A future improvement would wire them into a free-list.
+    }
+}
+
 /// Convenience flag set for user-accessible writable memory (ring 3).
 pub fn user_rw_flags() -> PageTableFlags {
     PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE

@@ -24,6 +24,7 @@
 //! responsible for re-enabling them appropriately.
 
 use crate::gdt;
+use crate::memory::GuardedStack;
 use crate::serial_println;
 use crate::signal::{self, SavedSigContext, SignalState};
 use alloc::boxed::Box;
@@ -35,14 +36,22 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 use x86_64::{PhysAddr, VirtAddr};
 
-/// Each kernel task gets a 128 KiB stack. These stacks live on the kernel heap
-/// (no hardware guard page), so an overflow silently corrupts adjacent heap
-/// objects and wedges the kernel. Some tasks run deep, allocation-heavy call
-/// chains — e.g. `ahci-init` walks `ahci::init → block::selftest →
-/// nextfs_selftest → init_user::run`, each frame also formatting strings and
-/// mapping page tables — so 32 KiB proved too tight and would overflow once
-/// real disks were attached. 128 KiB gives a comfortable margin.
+/// Each kernel task gets a 128 KiB stack with a hardware guard page below it.
+/// The guard page is left unmapped so a stack overflow triggers a clean page
+/// fault instead of silently corrupting adjacent kernel heap data.
+/// 132 KiB total per stack: 1 guard (4 KiB) + 32 usable pages (128 KiB).
 const KSTACK_SIZE: usize = 128 * 1024;
+
+/// Virtual address for the next guarded kernel stack allocation. Uses a range
+/// in the upper half of the address space, well clear of the physical memory
+/// mapping (which the bootloader places dynamically) and the kernel heap
+/// (0x4444_4444_0000).
+/// Each allocation is 132 KiB (33 pages), so the counter advances accordingly.
+const GUARDED_STACK_VIRT_BASE: u64 = 0x_FFFF_9000_0000_0000;
+/// Space reserved per stack (1 guard page + 32 stack pages = 33 pages).
+const GUARDED_STACK_STRIDE: u64 = 33 * 4096;
+/// Counter for the next stack virtual address allocation.
+static NEXT_GUARDED_STACK: AtomicU64 = AtomicU64::new(GUARDED_STACK_VIRT_BASE);
 
 /// Monotonic task-ID counter.
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
@@ -106,7 +115,8 @@ pub struct Task {
     pub kstack_top: VirtAddr,
     pub state: State,
     /// Backing storage for the kernel stack (owned to keep it alive).
-    _stack: Box<[u8]>,
+    /// The guard page below catches stack overflow as a clean page fault.
+    _stack: GuardedStack,
     /// Privilege level: kernel (ring 0) or user (ring 3).
     pub ring: Ring,
     /// User-space page table (CR3 physical address). Only valid for ring 3 tasks.
@@ -216,6 +226,15 @@ extern "C" fn task_exit_current() -> ! {
 }
 
 impl Task {
+    /// Allocate a new guarded stack from the dedicated virtual region.
+    /// Returns the stack guard object and the 16-byte aligned top address.
+    fn alloc_stack() -> (GuardedStack, u64) {
+        let virt = NEXT_GUARDED_STACK.fetch_add(GUARDED_STACK_STRIDE, Ordering::SeqCst);
+        let stack = GuardedStack::new(VirtAddr::new(virt));
+        let top = (stack.top().as_u64()) & !0xF;
+        (stack, top)
+    }
+
     /// Create a new kernel task that begins executing `entry`.
     ///
     /// We hand-craft the initial stack so that the very first `context_switch`
@@ -223,13 +242,12 @@ impl Task {
     /// `entry`. The entry function pointer is smuggled in via the `r12` slot.
     fn new(name: &str, entry: extern "C" fn() -> !) -> Task {
         let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
-        let stack: Box<[u8]> = vec![0u8; KSTACK_SIZE].into_boxed_slice();
+        let (stack, top) = Self::alloc_stack();
 
         // 16-byte align the top so the System V ABI stack alignment holds at
         // the entry of `entry` (rsp % 16 == 8 right after the trampoline's
         // `call`, which is what the ABI expects).
-        let base = stack.as_ptr() as u64;
-        let top = (base + KSTACK_SIZE as u64) & !0xF;
+        // Note: top is already 16-byte aligned from alloc_stack.
 
         // Lay out the initial saved context (see context-switch contract):
         //   [top-1] = return address  -> task_trampoline
@@ -334,9 +352,7 @@ fn spawn_user_from_entry(
 
     // Create a task structure (with a kernel stack for syscalls/interrupts).
     let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
-    let stack: Box<[u8]> = vec![0u8; KSTACK_SIZE].into_boxed_slice();
-    let base = stack.as_ptr() as u64;
-    let kstack_top = (base + KSTACK_SIZE as u64) & !0xF;
+    let (stack, kstack_top) = Task::alloc_stack();
 
     // For a user task, we craft a kernel stack so that when context_switch
     // "returns" into this task, it jumps to the trampoline, which then irets to ring 3.
@@ -743,9 +759,7 @@ pub fn do_fork(frame: &crate::syscall::SyscallFrame) -> u64 {
 
     // 2. Allocate the child's kernel stack.
     let child_id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
-    let stack: Box<[u8]> = vec![0u8; KSTACK_SIZE].into_boxed_slice();
-    let base = stack.as_ptr() as u64;
-    let kstack_top = (base + KSTACK_SIZE as u64) & !0xF;
+    let (stack, kstack_top) = Task::alloc_stack();
 
     // Read the parent's CPU iret frame (just above the SyscallFrame).
     let frame_base = frame as *const crate::syscall::SyscallFrame as *const u64;

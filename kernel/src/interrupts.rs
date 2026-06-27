@@ -270,7 +270,7 @@ extern "x86-interrupt" fn page_fault_handler(
         crate::task::do_exit(139); // 128 + SIGSEGV(11)
     }
 
-    panic!("unhandled page fault\n{:#?}", stack_frame);
+    panic!("unhandled page fault\n{:#?}\n fault addr: {:#x}\n error: {:?}", stack_frame, addr, error_code);
 }
 
 extern "x86-interrupt" fn double_fault_handler(
