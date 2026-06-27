@@ -14,8 +14,9 @@
 //!     subsystem (heap, task stacks, user processes) can map memory later.
 //!   * User-space page table creation and management for process isolation.
 
+use crate::serial_println;
 use alloc::vec::Vec;
-use bootloader_api::info::{MemoryRegion, MemoryRegions, MemoryRegionKind};
+use bootloader_api::info::{MemoryRegion, MemoryRegionKind, MemoryRegions};
 use spin::Mutex;
 use x86_64::{
     structures::paging::{
@@ -24,10 +25,14 @@ use x86_64::{
     },
     PhysAddr, VirtAddr,
 };
-use crate::serial_println;
 
 /// Start of the user heap region (will be expanded via sbrk in the future).
 pub const USER_HEAP_START: u64 = 0x0000_0001_0000_0000;
+
+/// The flag bit used in L1 page table entries to mark Copy-on-Write pages.
+/// Bit 9 is available to the OS per the x86_64 specification — it is ignored
+/// by the CPU for page-table walks and never set by the hardware.
+pub const COW_FLAG: PageTableFlags = PageTableFlags::BIT_9;
 
 /// Build a mapper for the currently-active level-4 page table.
 ///
@@ -279,6 +284,152 @@ impl MemoryManager {
         unsafe { OffsetPageTable::new(new_l4, offset) }
     }
 
+    /// Create a Copy-on-Write fork of a user address space.
+    ///
+    /// Instead of deep-copying every user page (the O(n) bottleneck), this
+    /// shares all user frames between parent and child by:
+    ///   1. Clearing the WRITABLE bit on every parent user page that *was*
+    ///      writable, and setting the COW flag (BIT_9) to mark it.
+    ///   2. Creating a fresh address-space *structure* for the child (via
+    ///      [`create_user_mapper`]), then copying each parent L1 entry into the
+    ///      child's tables verbatim — both now point at the same physical frame
+    ///      with the same (read-only + COW) flags.
+    ///
+    /// On the next write to any shared page, the CPU raises a page fault.
+    /// The page fault handler detects the COW flag, allocates a fresh frame,
+    /// copies the data, and maps it writable without COW in the faulting task's
+    /// address space. Pages that were genuinely read-only in the parent stay
+    /// shared read-only forever (no COW flag).
+    ///
+    /// The parent's TLB is flushed for each PTE that was made read-only so the
+    /// parent sees the new permissions immediately. Returns the child's L4
+    /// physical address (its CR3 value), recorded in `user_page_tables`.
+    pub fn cow_fork_address_space(&mut self, parent_cr3: PhysAddr) -> PhysAddr {
+        let offset = self.physical_memory_offset;
+
+        // ---- Step 1: Walk the parent's user pages. For each writable leaf,
+        //      clear WRITABLE and set COW_FLAG in place. ----
+        //
+        // We also record every leaf entry so we can replicate it in the child.
+        // Form: (virtual_address, raw_pte_u64).
+        let mut user_leaves: Vec<(u64, u64)> = Vec::new();
+
+        let l4 = unsafe { &mut *((offset + parent_cr3.as_u64()).as_mut_ptr::<PageTable>()) };
+        for i4 in 0..256usize {
+            let e4 = &l4[i4];
+            if e4.is_unused() || e4.flags().contains(PageTableFlags::HUGE_PAGE) {
+                continue;
+            }
+            let l3 = unsafe { &mut *((offset + e4.addr().as_u64()).as_mut_ptr::<PageTable>()) };
+            for i3 in 0..512 {
+                let e3 = &l3[i3];
+                if e3.is_unused() || e3.flags().contains(PageTableFlags::HUGE_PAGE) {
+                    continue;
+                }
+                let l2 = unsafe { &mut *((offset + e3.addr().as_u64()).as_mut_ptr::<PageTable>()) };
+                for i2 in 0..512 {
+                    let e2 = &l2[i2];
+                    if e2.is_unused() || e2.flags().contains(PageTableFlags::HUGE_PAGE) {
+                        continue;
+                    }
+                    let l1 =
+                        unsafe { &mut *((offset + e2.addr().as_u64()).as_mut_ptr::<PageTable>()) };
+                    for i1 in 0..512 {
+                        let e1 = &l1[i1];
+                        if e1.is_unused()
+                            || !e1.flags().contains(PageTableFlags::USER_ACCESSIBLE)
+                        {
+                            continue;
+                        }
+
+                        let vaddr = ((i4 as u64) << 39)
+                            | ((i3 as u64) << 30)
+                            | ((i2 as u64) << 21)
+                            | ((i1 as u64) << 12);
+
+                        let flags = e1.flags();
+                        let raw_entry = e1.addr().as_u64() | flags.bits();
+
+                        if flags.contains(PageTableFlags::WRITABLE) {
+                            // Make the parent's PTE read-only + COW.
+                            let cow_addr = e1.addr();
+                            let cow_flags = (flags & !PageTableFlags::WRITABLE) | COW_FLAG;
+                            l1[i1].set_addr(cow_addr, cow_flags);
+                            // Flush this page from the TLB so the parent sees
+                            // the new read-only mapping immediately.
+                            unsafe {
+                                x86_64::instructions::tlb::flush(VirtAddr::new(vaddr));
+                            }
+                            user_leaves.push((vaddr, cow_addr.as_u64() | cow_flags.bits()));
+                        } else {
+                            // Already read-only: share as-is, no COW flag.
+                            user_leaves.push((vaddr, raw_entry));
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- Step 2: Create a fresh address space for the child. ----
+        let mut child_mapper = self.create_user_mapper();
+
+        // ---- Step 3: Map each shared leaf in the child. ----
+        // For each leaf we (a) call map_to to create intermediate page-table
+        // pages (L3/L2) if they don't exist, then (b) overwrite the L1 entry
+        // with the verbatim PTE.
+        for (vaddr, raw_entry) in user_leaves {
+            let page = Page::<Size4KiB>::containing_address(VirtAddr::new(vaddr));
+            let frame_addr = PhysAddr::new(raw_entry & 0x000f_ffff_ffff_f000);
+            let frame = PhysFrame::containing_address(frame_addr);
+
+            // (a) Create intermediate tables.
+            unsafe {
+                let temp_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+                match child_mapper.map_to(page, frame, temp_flags, &mut self.frame_allocator) {
+                    Ok(flush) => flush.ignore(),
+                    Err(e) => {
+                        serial_println!(
+                            "memory :: cow_fork: map_to failed for {:#x}: {:?}",
+                            vaddr,
+                            e
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            // (b) Overwrite the leaf PTE with the shared entry.
+            let child_l4: &mut PageTable = child_mapper.level_4_table();
+            let child_l4_virt = VirtAddr::from_ptr(child_l4);
+            let child_l4_phys_addr = child_l4_virt.as_u64() - offset.as_u64();
+            let child_l4_table =
+                unsafe { &mut *((offset + child_l4_phys_addr).as_mut_ptr::<PageTable>()) };
+            let ci4 = (vaddr >> 39) & 0x1FF;
+            let ci3 = (vaddr >> 30) & 0x1FF;
+            let ci2 = (vaddr >> 21) & 0x1FF;
+            let ci1 = (vaddr >> 12) & 0x1FF;
+
+            let ce3_addr = child_l4_table[ci4 as usize].addr();
+            let ce3_table =
+                unsafe { &mut *((offset + ce3_addr.as_u64()).as_mut_ptr::<PageTable>()) };
+            let ce2_addr = ce3_table[ci3 as usize].addr();
+            let ce2_table =
+                unsafe { &mut *((offset + ce2_addr.as_u64()).as_mut_ptr::<PageTable>()) };
+            let ce1_addr = ce2_table[ci2 as usize].addr();
+            let ce1_table =
+                unsafe { &mut *((offset + ce1_addr.as_u64()).as_mut_ptr::<PageTable>()) };
+
+            // Write the exact raw PTE bits — this preserves COW_FLAG and the lack of
+            // WRITABLE, so the child also sees the page as read-only + COW.
+            let raw_addr = PhysAddr::new(raw_entry & 0x000f_ffff_ffff_f000);
+            let raw_flags = PageTableFlags::from_bits_truncate(raw_entry & !0x000f_ffff_ffff_f000);
+            ce1_table[ci1 as usize].set_addr(raw_addr, raw_flags);
+        }
+
+        // ---- Step 4: Register and return the child's CR3. ----
+        self.store_user_mapper(child_mapper)
+    }
+
     /// Duplicate a user address space for `fork`.
     ///
     /// Creates a brand-new address space (kernel mappings shared, user half
@@ -364,7 +515,8 @@ impl MemoryManager {
                     Err(e) => {
                         serial_println!(
                             "memory :: fork: failed to map child page {:#x}: {:?}",
-                            vaddr, e
+                            vaddr,
+                            e
                         );
                     }
                 }

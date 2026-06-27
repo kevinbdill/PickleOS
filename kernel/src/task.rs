@@ -729,8 +729,12 @@ pub fn do_fork(frame: &crate::syscall::SyscallFrame) -> u64 {
         }
     };
 
-    // 1. Duplicate the address space (copy every user page into private frames).
-    let child_cr3 = crate::memory::with_memory(|mem| mem.duplicate_user_address_space(parent_cr3));
+    // 1. Create the child's address space via Copy-on-Write.
+    //    All writable user pages are shared read-only + COW between parent and child.
+    //    The parent's TLB is flushed for each modified PTE so it sees the new
+    //    permissions immediately. A private copy is made only when either process
+    //    writes to a shared page (resolved in the page fault handler).
+    let child_cr3 = crate::memory::with_memory(|mem| mem.cow_fork_address_space(parent_cr3));
 
     // 2. Allocate the child's kernel stack.
     let child_id = NEXT_ID.fetch_add(1, Ordering::SeqCst);

@@ -15,6 +15,7 @@ use lazy_static::lazy_static;
 use pic8259::ChainedPics;
 use spin::Mutex;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
+use x86_64::structures::paging::{FrameAllocator, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB};
 
 /// Base vector for the primary PIC after remapping (just past the 32 CPU
 /// exception vectors).
@@ -148,15 +149,110 @@ extern "x86-interrupt" fn page_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
+    use crate::memory::{with_memory, COW_FLAG};
     use x86_64::registers::control::Cr2;
+    use x86_64::structures::paging::{PageTable, PageTableFlags, PhysFrame};
+    use x86_64::VirtAddr;
+
     // CR2 holds the faulting virtual address.
     let addr = Cr2::read();
-    println!("EXCEPTION: PAGE FAULT");
-    println!("  Accessed Address: {:?}", addr);
-    println!("  Error Code: {:?}", error_code);
-    serial_println!("PAGE FAULT @ {:?} code={:?}", addr, error_code);
-    // TODO: once demand paging / copy-on-write exists, attempt to service the
-    // fault here (map a frame, copy a COW page) before giving up.
+
+    // --- COW resolution: attempt to service a write to a COW page -----------
+    // Conditions:
+    //   1. User-mode fault (page was USER_ACCESSIBLE).
+    //   2. Error code indicates a WRITE that caused the fault.
+    //   3. Error code indicates PAGE_LEVEL_PROTECTION violation (P flag set =
+    //      the page was *present* but permissions blocked the access).
+    //   4. The leaf PTE has our COW_FLAG set (bit 9) and WRITABLE is clear.
+    if error_code.contains(PageFaultErrorCode::USER_MODE)
+        && error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE)
+        && error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION)
+    {
+        let fault_vaddr = addr.as_u64();
+
+        let resolved = crate::task::scheduler::with(|s| {
+            let cur = s.current;
+            let cr3 = s.tasks[cur].user_cr3?;
+            let offset = with_memory(|m| m.physical_memory_offset);
+
+            // Walk the faulting task's page tables to reach the L1 entry.
+            let l4 = unsafe { &mut *((offset + cr3.as_u64()).as_mut_ptr::<PageTable>()) };
+            let i4 = ((fault_vaddr >> 39) & 0x1FF) as usize;
+            if l4[i4].is_unused() || l4[i4].flags().contains(PageTableFlags::HUGE_PAGE) {
+                return None;
+            }
+            let l3 = unsafe { &mut *((offset + l4[i4].addr().as_u64()).as_mut_ptr::<PageTable>()) };
+            let i3 = ((fault_vaddr >> 30) & 0x1FF) as usize;
+            if l3[i3].is_unused() || l3[i3].flags().contains(PageTableFlags::HUGE_PAGE) {
+                return None;
+            }
+            let l2 = unsafe { &mut *((offset + l3[i3].addr().as_u64()).as_mut_ptr::<PageTable>()) };
+            let i2 = ((fault_vaddr >> 21) & 0x1FF) as usize;
+            if l2[i2].is_unused() || l2[i2].flags().contains(PageTableFlags::HUGE_PAGE) {
+                return None;
+            }
+            let l1 = unsafe {
+                &mut *((offset + l2[i2].addr().as_u64()).as_mut_ptr::<PageTable>())
+            };
+            let i1 = ((fault_vaddr >> 12) & 0x1FF) as usize;
+
+            let entry = &l1[i1];
+            let flags = entry.flags();
+
+            // Must be: present, user-accessible, NOT writable, and COW flag set.
+            if !flags.contains(PageTableFlags::PRESENT)
+                || !flags.contains(PageTableFlags::USER_ACCESSIBLE)
+                || flags.contains(PageTableFlags::WRITABLE)
+                || !flags.contains(COW_FLAG)
+            {
+                return None;
+            }
+
+            // Genuine COW fault: allocate a new frame, copy data, remap writable.
+            let old_frame = entry.frame().ok()?;
+            let old_phys = old_frame.start_address();
+
+            let new_frame = with_memory(|m| m.frame_allocator.allocate_frame())?;
+            let new_phys = new_frame.start_address();
+
+            // Byte-copy the page content (old shared frame -> new private frame).
+            let src_ptr = (offset + old_phys.as_u64()).as_ptr::<u8>();
+            let dst_ptr = (offset + new_phys.as_u64()).as_mut_ptr::<u8>();
+            unsafe {
+                core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, 4096);
+            }
+
+            // Update the PTE: point to the new frame, mark it writable, clear COW.
+            // Preserve all other flags (USER_ACCESSIBLE, NO_EXECUTE, etc.).
+            let mut new_flags = flags;
+            new_flags.insert(PageTableFlags::WRITABLE);
+            new_flags.remove(COW_FLAG);
+
+            l1[i1].set_addr(new_phys, new_flags);
+
+            // Flush this page from the TLB so the new mapping takes effect.
+            unsafe {
+                x86_64::instructions::tlb::flush(VirtAddr::new(fault_vaddr));
+            }
+
+            serial_println!(
+                "[cow] resolved COW fault @ {:#x}: old={:#x} -> new={:#x}",
+                fault_vaddr,
+                old_phys.as_u64(),
+                new_phys.as_u64()
+            );
+
+            Some(())
+        });
+
+        if resolved.is_some() {
+            // COW resolved successfully; return from the fault handler.
+            // The CPU re-executes the faulting instruction, which now
+            // succeeds because the page is writable in this address space.
+            return;
+        }
+        // Fall through: COW resolution did not apply.
+    }
 
     // A fault originating in user mode means a buggy user program dereferenced
     // bad memory. Kill just that task rather than panicking the whole kernel so
