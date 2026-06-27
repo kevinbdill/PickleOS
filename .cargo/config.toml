@@ -1,0 +1,38 @@
+# Cargo configuration for building PICKLE OS against a custom bare-metal target.
+
+[build]
+# Build for the freestanding bare-metal x86_64 target by default. Running plain
+# `cargo build` cross-compiles the kernel instead of building for the host.
+#
+# We use a custom spec, `x86_64-pickleos.json`, derived from the built-in
+# `x86_64-unknown-none` target but with one crucial change: **PIE is disabled**
+# (`relocation-model = static`, `position-independent-executables = false`). The
+# `bootloader` 0.9 crate loads the kernel at a fixed address and does NOT apply
+# ELF relocations, so a position-independent executable would jump to garbage.
+# The spec also disables the red-zone and hardware float (soft-float), so
+# interrupt handlers never corrupt the stack or clobber SSE/MMX registers.
+target = "x86_64-pickleos.json"
+
+[unstable]
+# Recent nightly requires opting in to JSON target specs explicitly.
+json-target-spec = true
+# Recompile the `core`, `alloc` and `compiler_builtins` crates from source for
+# our custom target. The precompiled std/core that ships with rustup only
+# targets known platforms; our `x86_64-pickleos` target is unknown to it, so we
+# must build the sysroot crates ourselves.
+build-std = ["core", "compiler_builtins", "alloc"]
+# `compiler_builtins` needs memcpy/memset/memcmp etc. on a freestanding target
+# where no libc is available. This feature provides Rust implementations.
+build-std-features = ["compiler-builtins-mem"]
+
+# ---------------------------------------------------------------------------
+# `cargo run` integration via the `bootimage` runner.
+#
+# When you run `cargo run`, cargo will (after building the kernel) invoke
+# `bootimage runner <path-to-kernel-binary>`. The runner links the kernel
+# together with the `bootloader` crate into a bootable disk image and then
+# boots it in QEMU using the arguments configured in the kernel's Cargo.toml
+# under `[package.metadata.bootimage]`.
+# ---------------------------------------------------------------------------
+[target.'cfg(target_os = "none")']
+runner = "bootimage runner"

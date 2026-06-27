@@ -1,0 +1,29 @@
+# NextOS — A Rust microkernel operating system starter kit.
+#
+# This is a Cargo *workspace*. Right now it contains a single member (`kernel`),
+# but it is structured so that future user-space components (init, drivers,
+# the Wayland-style compositor, etc.) can be added as additional workspace
+# members and share a common dependency/lock file.
+[workspace]
+resolver = "2"
+members = [
+    "kernel",
+    "userspace/libpickleos",
+    "userspace/filemanager",
+    "userspace/texteditor",
+    "userspace/launcher",
+    "userspace/taskbar",
+    # TODO: future user-space members, e.g.
+    # "userland/init",
+    # "userland/drivers/virtio-blk",
+    # "userland/compositor",
+]
+
+# Build the kernel in release-ish mode even for `dev` so panics and unwinding
+# behave predictably on bare metal. We disable unwinding entirely (panic=abort)
+# because there is no unwinder in a freestanding binary.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

@@ -1,0 +1,11 @@
+[package]
+name = "texteditor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libpickleos = { path = "../libpickleos" }
+
+[[bin]]
+name = "texteditor"
+path = "src/main.rs"

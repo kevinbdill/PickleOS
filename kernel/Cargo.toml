@@ -1,0 +1,76 @@
+[package]
+name = "kernel"
+version = "0.1.0"
+edition = "2021"
+authors = ["NextOS contributors"]
+description = "NextOS microkernel — a memory-safe x86_64 microkernel starter kit in Rust"
+license = "MIT OR Apache-2.0"
+
+# The kernel is a freestanding binary; `cargo test` would normally try to use
+# the host test harness, which does not exist on bare metal. We provide a
+# custom test framework instead (see `src/main.rs`).
+[[bin]]
+name = "kernel"
+test = false
+bench = false
+
+[dependencies]
+
+# `volatile` ensures the compiler does not optimize away memory-mapped I/O
+# writes (used by the VGA text buffer).
+volatile = "0.2.6"
+
+# A simple spinlock-based Mutex usable without an OS / threads. Used to guard
+# global mutable state such as the VGA writer and serial port.
+spin = "0.9.8"
+
+# Zero-cost wrappers around x86_64 instructions and structures: the IDT, GDT,
+# page tables, control registers, port I/O, etc. This is the backbone of the
+# low-level kernel code.
+x86_64 = "0.14.13"
+
+# 16550 UART serial driver — lets the kernel print to the host terminal via
+# QEMU's serial redirection. Invaluable for debugging and automated testing.
+uart_16550 = "0.2.19"
+
+# Programmable interrupt controller (8259 PIC) driver for legacy interrupt
+# routing (timer, keyboard, etc.).
+pic8259 = "0.10.4"
+
+# Scancode -> keyboard event decoding for the keyboard interrupt handler.
+pc-keyboard = "0.7.0"
+
+# A `#[global_allocator]` implementation. We use a fixed-size block allocator
+# backed linked-list allocator for the kernel heap. `linked_list_allocator`
+# provides a robust, well-tested heap with `alloc`/`dealloc`.
+linked_list_allocator = "0.10.5"
+bootloader_api = "=0.11.15"
+font8x8 = { version = "0.3.1", default-features = false }
+smoltcp = { version = "0.11", default-features = false, features = ["proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "socket-icmp", "socket-dns", "medium-ethernet", "alloc"] }
+
+# `lazy_static` with the `spin_no_std` feature lets us lazily initialize global
+# statics (IDT, GDT) without a heap and without the standard library.
+[dependencies.lazy_static]
+version = "1.5.0"
+features = ["spin_no_std"]
+
+# ---------------------------------------------------------------------------
+# bootimage / QEMU configuration.
+#
+# These arguments are passed to QEMU by `bootimage runner`. The isa-debug-exit
+# device gives the kernel a way to exit QEMU with a chosen exit code (used by
+# the integration-test harness), and serial output is redirected to stdio so
+# kernel logs appear in the terminal.
+# ---------------------------------------------------------------------------
+[package.metadata.bootimage]
+run-args = [
+    "-serial", "stdio",
+]
+test-args = [
+    "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-serial", "stdio",
+    "-display", "none",
+]
+# Exit code QEMU returns on a successful test run (mapped from our `(0x10 << 1) | 1`).
+test-success-exit-code = 33
+test-timeout = 60

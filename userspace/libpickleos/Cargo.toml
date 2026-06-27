@@ -1,0 +1,17 @@
+[package]
+name = "libpickleos"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+# For heap allocator
+linked_list_allocator = "0.10.5"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

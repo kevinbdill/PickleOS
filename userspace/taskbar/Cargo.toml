@@ -1,0 +1,11 @@
+[package]
+name = "taskbar"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libpickleos = { path = "../libpickleos" }
+
+[[bin]]
+name = "taskbar"
+path = "src/main.rs"

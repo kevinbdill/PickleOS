@@ -1,0 +1,16 @@
+# NextOS requires a *nightly* Rust toolchain because we rely on several
+# unstable features that are essential for OS development:
+#
+#   * `build-std`            — recompile `core`/`alloc`/`compiler_builtins`
+#                              for our custom bare-metal target.
+#   * inline assembly        — low-level CPU access (now stable, but kept on
+#                              nightly for consistency with other unstable bits).
+#   * `abi_x86_interrupt`    — the special `x86-interrupt` calling convention
+#                              used by interrupt handlers in `interrupts.rs`.
+#   * `alloc_error_handler`  — custom handler for allocation failure.
+#
+# Pinning the toolchain here guarantees every contributor builds with a
+# compatible nightly and the required components.
+[toolchain]
+channel = "nightly"
+components = ["rust-src", "llvm-tools-preview", "rustfmt", "clippy"]
